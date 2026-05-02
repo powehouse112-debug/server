@@ -1239,25 +1239,19 @@ exports.updateActiveOrder = async (req, res) => {
     const orderId = req.params.id;
     const { itemsToAdd = [] } = req.body;
 
-    if (!itemsToAdd || itemsToAdd.length === 0) {
+    if (!itemsToAdd || itemsToAdd.length === 0)
       return res.status(400).json({ success: false, message: 'itemsToAdd empty hai' });
-    }
 
     const order = await Order.findById(orderId);
-
-    if (!order) {
-      return res.status(404).json({ success: false, message: 'Order not found' });
-    }
-
-    if (String(order.branchId) !== String(req.user.branchId)) {
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (String(order.branchId) !== String(req.user.branchId))
       return res.status(403).json({ success: false, message: 'Unauthorized' });
-    }
+    if (order.status === 'completed' || order.status === 'cancelled')
+      return res.status(400).json({ success: false, message: `Order already ${order.status} hai` });
 
-    if (order.status === 'completed' || order.status === 'cancelled') {
-      return res.status(400).json({ success: false, message: `Order already ${order.status} hai — update nahi ho sakta` });
-    }
+    // ✅ NEW: System settings fetch
+    const { kitchenSystemEnabled, barmanSystemEnabled } = await getSystemSettings(req.user.branchId);
 
-    // Process and merge new items
     for (const newItem of itemsToAdd) {
       const itemSubtotal = newItem.subtotal != null
         ? Number(newItem.subtotal)
@@ -1293,24 +1287,26 @@ exports.updateActiveOrder = async (req, res) => {
 
       if (newItem.isColdDrink || newItem.type === 'cold_drink') {
         order.hasColdDrinks = true;
-        order.coldDrinksStatus = 'pending';
+        // ✅ Only set pending if barman system ON
+        if (barmanSystemEnabled) order.coldDrinksStatus = 'pending';
       }
     }
 
-    // Recalculate totals
     const newSubtotal = order.items.reduce((s, i) => s + (i.subtotal || 0), 0);
     order.subtotal = newSubtotal;
     order.total = newSubtotal - (order.discount || 0);
 
-    // ✅ ADDED: Chef ko notify karo — cashier ne update kiya
-    order.updatedByWaiter = true;
-    order.updatedByCashier = true;
-    order.waiterUpdatedAt = new Date();
-    order.waiterUpdatedBy = req.user.name || 'Cashier';
+    // ✅ NEW: Kitchen OFF ho to updatedByWaiter flag mat lagao — chef ko notify nahi
+    if (kitchenSystemEnabled) {
+      order.updatedByWaiter = true;
+      order.updatedByCashier = true;
+      order.waiterUpdatedAt = new Date();
+      order.waiterUpdatedBy = req.user.name || 'Cashier';
+    }
 
-    // ✅ ADDED: Agar order ready/delivered tha toh dobara preparing pe lao
     const wasReadyOrDelivered = ['ready', 'delivered'].includes(order.status);
-    if (wasReadyOrDelivered) {
+    // ✅ NEW: Kitchen OFF ho to status reset mat karo
+    if (kitchenSystemEnabled && wasReadyOrDelivered) {
       order.status = 'preparing';
       order.stockDeducted = false;
     }
@@ -1325,34 +1321,36 @@ exports.updateActiveOrder = async (req, res) => {
 
     const io = req.app.get('io');
     if (io) {
-      io.to(String(req.user.branchId)).emit('order-updated', {
-        orderId: String(order._id),
-        orderNumber: order.orderNumber,
-        message: `Order #${order.orderNumber} updated by cashier`,
-        addedCount: itemsToAdd.length,
-      });
+      // ✅ NEW: Sirf kitchen ON ho tab chef ko emit karo
+      if (kitchenSystemEnabled) {
+        io.to(String(req.user.branchId)).emit('order-updated', {
+          orderId: String(order._id),
+          orderNumber: order.orderNumber,
+          message: `Order #${order.orderNumber} updated by cashier`,
+          addedCount: itemsToAdd.length,
+        });
 
-      // ✅ ADDED: Chef screen ko specifically notify karo
-      io.to(String(req.user.branchId)).emit('order-updated-by-waiter', {
-        orderId: String(order._id),
-        orderNumber: order.orderNumber,
-        orderType: order.orderType,
-        tableNumber: order.tableNumber || null,
-        floor: order.floor || null,
-        status: order.status,
-        statusReset: wasReadyOrDelivered,
-        waiterName: req.user.name || 'Cashier',
-        waiterUpdatedAt: order.waiterUpdatedAt,
-        total: order.total,
-        itemCount: order.items.length,
-        updatedByCashier: true,
-        message: wasReadyOrDelivered
-          ? `⚠️ Cashier ne ready order update ki — dobara check karein!`
-          : `📝 Cashier ne order #${order.orderNumber} update kiya`,
-      });
+        io.to(String(req.user.branchId)).emit('order-updated-by-waiter', {
+          orderId: String(order._id),
+          orderNumber: order.orderNumber,
+          orderType: order.orderType,
+          tableNumber: order.tableNumber || null,
+          floor: order.floor || null,
+          status: order.status,
+          statusReset: wasReadyOrDelivered,
+          waiterName: req.user.name || 'Cashier',
+          waiterUpdatedAt: order.waiterUpdatedAt,
+          total: order.total,
+          itemCount: order.items.length,
+          updatedByCashier: true,
+          message: wasReadyOrDelivered
+            ? `⚠️ Cashier ne ready order update ki — dobara check karein!`
+            : `📝 Cashier ne order #${order.orderNumber} update kiya`,
+        });
+      }
 
       const hasColdDrinkAdditions = itemsToAdd.some(i => i.isColdDrink || i.type === 'cold_drink');
-      if (hasColdDrinkAdditions) {
+      if (hasColdDrinkAdditions && barmanSystemEnabled) {
         io.to(String(req.user.branchId)).emit('new-colddrink-order', {
           orderId: String(order._id),
           orderNumber: order.orderNumber,
@@ -1364,6 +1362,9 @@ exports.updateActiveOrder = async (req, res) => {
     res.json({
       success: true,
       order: populatedOrder,
+      // ✅ NEW: Frontend ko pata chale kitchen ON/OFF hai
+      kitchenSystemEnabled,
+      barmanSystemEnabled,
       message: `✅ Order #${order.orderNumber} update ho gaya — ${itemsToAdd.length} item(s) add hue`,
     });
   } catch (error) {
