@@ -1,38 +1,52 @@
 const mongoose = require('mongoose');
 const Counter = require('../models/Counter');
 
+let _orderCounterSynced = false; // process lifetime mein sirf 1 baar check hoga
+
 const generateOrderNumber = async () => {
   const Order = mongoose.model('Order');
 
-  // Har baar DB se highest existing order number lo
-  const lastOrder = await Order.findOne(
-    { orderNumber: { $regex: /^ORD-\d+$/ } },
-    { orderNumber: 1 },
-    { sort: { createdAt: -1 } }  // ✅ createdAt se sort — string sort galat hoti
-  );
+  // ✅ Sirf EK BAAR (jab tak server restart na ho) Counter ko Order collection
+  //    ke max existing number se sync karo — taake purana/galat Counter fix ho jaye.
+  //    Iske baad har order pe ye slow regex-scan nahi chalega.
+  if (!_orderCounterSynced) {
+    const lastOrder = await Order.findOne(
+      { orderNumber: { $regex: /^ORD-\d+$/ } },
+      { orderNumber: 1 },
+      { sort: { createdAt: -1 } }
+    );
 
-  let maxExisting = 0;
-  if (lastOrder) {
-    const num = parseInt(lastOrder.orderNumber.replace('ORD-', ''));
-    maxExisting = isNaN(num) ? 0 : num;
+    let maxExisting = 0;
+    if (lastOrder) {
+      const num = parseInt(lastOrder.orderNumber.replace('ORD-', ''));
+      maxExisting = isNaN(num) ? 0 : num;
+    }
+
+    await Counter.findByIdAndUpdate(
+      'orderNumber',
+      [
+        {
+          $set: {
+            seq: {
+              $cond: {
+                if: { $lte: ['$seq', maxExisting] },
+                then: maxExisting,
+                else: '$seq',
+              },
+            },
+          },
+        },
+      ],
+      { upsert: true }
+    );
+
+    _orderCounterSynced = true; // ✅ ab future calls fast path lengi
   }
 
-  // Counter ko max existing se upar rakho — kabhi neeche nahi jaaye
+  // ✅ Fast path — har order ke liye sirf yahi chalega (1 atomic DB call, no scan)
   const updated = await Counter.findByIdAndUpdate(
     'orderNumber',
-    [
-      {
-        $set: {
-          seq: {
-            $cond: {
-              if: { $lte: ['$seq', maxExisting] },
-              then: maxExisting + 1,   // ✅ existing se aage
-              else: { $add: ['$seq', 1] }  // ✅ already aage hai toh normal increment
-            }
-          }
-        }
-      }
-    ],
+    { $inc: { seq: 1 } },
     { new: true, upsert: true }
   );
 
@@ -55,5 +69,5 @@ const calculateOrderTotal = (items, discount = 0, taxRate = 0) => {
 module.exports = {
   generateOrderNumber,
   calculateTotalTime,
-  calculateOrderTotal
+  calculateOrderTotal,
 };

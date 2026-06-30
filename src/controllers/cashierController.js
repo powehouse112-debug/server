@@ -888,18 +888,18 @@ exports.createOrder = async (req, res) => {
       orderType, tableNumber, floor, customerName, customerPhone,
       deliveryAddress, cashierNote, notes, discount = 0, items = [],
     } = req.body;
-
+ 
     if (!items || items.length === 0)
       return res.status(400).json({ success: false, message: 'Items required' });
-
+ 
     const branchId = req.user.branchId;
-
+ 
     // ── System settings ────────────────────────────────────────────────────
     const { kitchenSystemEnabled, barmanSystemEnabled } = await getSystemSettings(branchId);
-
+ 
     let subtotal = 0;
     const processedItems = [];
-
+ 
     for (const item of items) {
       const itemSubtotal = item.subtotal != null
         ? Number(item.subtotal)
@@ -921,22 +921,22 @@ exports.createOrder = async (req, res) => {
         coldDrinkSizeId: item.coldDrinkSizeId || null,
       });
     }
-
+ 
     const discountAmt = Math.min(Number(discount) || 0, subtotal);
     const total = subtotal - discountAmt;
     const orderNumber = await generateOrderNumber();
-
+ 
     const hasColdDrinksInOrder = processedItems.some(
       i => i.isColdDrink || i.type === 'cold_drink'
     );
-
+ 
     // ── Initial states based on system settings ────────────────────────────
     const initialStatus = kitchenSystemEnabled ? 'pending' : 'ready';
     const initialStockDed = !kitchenSystemEnabled;
     const coldDrinksStatus = (!hasColdDrinksInOrder || !barmanSystemEnabled)
       ? 'delivered'
       : 'pending';
-
+ 
     const order = await Order.create({
       orderNumber, branchId,
       orderType: orderType || 'dine_in',
@@ -955,31 +955,26 @@ exports.createOrder = async (req, res) => {
       hasColdDrinks: hasColdDrinksInOrder,
       coldDrinksStatus,
     });
-
-    if (orderType === 'dine_in' && tableNumber && floor) {
-      await Table.findOneAndUpdate(
-        { branchId, tableNumber, floor },
-        { isOccupied: true, currentOrderId: order._id }
-      );
-    }
-
-    // ── Deduct immediately if systems are OFF ──────────────────────────────
-    if (!kitchenSystemEnabled) {
-      await deductFoodIngredientsForOrder(processedItems);
-    }
-    if (hasColdDrinksInOrder && !barmanSystemEnabled) {
-      await deductColdDrinksForOrder(processedItems);
-    }
-
-    const populatedOrder = await Order.findById(order._id)
+ 
+    // ── ✅ FIX 1: Table update + populate ek sath parallel (independent calls) ──
+    const tableUpdatePromise = (orderType === 'dine_in' && tableNumber && floor)
+      ? Table.findOneAndUpdate(
+          { branchId, tableNumber, floor },
+          { isOccupied: true, currentOrderId: order._id }
+        )
+      : Promise.resolve(null);
+ 
+    const populatedOrderPromise = Order.findById(order._id)
       .populate('cashierId', 'name')
       .populate('waiterId', 'name')
       .populate('deliveryBoyId', 'name')
       .populate('items.itemId');
-
+ 
+    const [, populatedOrder] = await Promise.all([tableUpdatePromise, populatedOrderPromise]);
+ 
+    // ── ✅ FIX 2: Response PEHLE bhej do — user ko turant confirmation mile ──
     const io = req.app.get('io');
     if (io) {
-      // Notify chef only if kitchen ON
       if (kitchenSystemEnabled) {
         io.to(String(branchId)).emit('new-order', {
           orderId: order._id, orderNumber: order.orderNumber,
@@ -987,7 +982,6 @@ exports.createOrder = async (req, res) => {
           floor: order.floor, total: order.total, itemCount: processedItems.length,
         });
       }
-      // Notify barman only if barman ON
       if (hasColdDrinksInOrder && barmanSystemEnabled) {
         io.to(String(branchId)).emit('new-colddrink-order', {
           orderId: String(order._id), orderNumber: order.orderNumber,
@@ -1000,19 +994,36 @@ exports.createOrder = async (req, res) => {
         });
       }
     }
-
+ 
     res.status(201).json({
       success: true,
       order: populatedOrder,
       systemInfo: { kitchenSystemEnabled, barmanSystemEnabled },
       message: `Order #${orderNumber} created successfully`,
     });
+ 
+    // ── ✅ FIX 3: Inventory deduction RESPONSE KE BAAD, background mein ──────
+    //    User ko wait nahi karna — agar deduction fail bhi ho to order create
+    //    ho chuka hai, sirf stock thoda late update hoga (jo cosmetic hai).
+    if (!kitchenSystemEnabled) {
+      deductFoodIngredientsForOrder(processedItems).catch(err => {
+        console.error(`Background food deduction failed for order ${orderNumber}:`, err);
+      });
+    }
+    if (hasColdDrinksInOrder && !barmanSystemEnabled) {
+      deductColdDrinksForOrder(processedItems).catch(err => {
+        console.error(`Background cold drink deduction failed for order ${orderNumber}:`, err);
+      });
+    }
   } catch (error) {
     console.error('Create order error:', error);
-    res.status(500).json({ success: false, message: error.message });
+    // ✅ Agar response already bhej diya hai (deduction wale catch block mein
+    //    error aaye), to dobara res.json mat karo — warna "headers already sent" crash hoga
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: error.message });
+    }
   }
 };
-
 
 exports.getAmountSummary = async (req, res) => {
   try {
